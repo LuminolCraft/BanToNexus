@@ -1,6 +1,15 @@
 package org.luminolcraft.banToNexus
 
 import com.electronwill.nightconfig.core.file.CommentedFileConfig
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.plugins.websocket.*
+import io.ktor.client.request.*
+import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
+import org.luminolcraft.banToNexus.Main.Companion.configManager
 import java.io.File
 import java.net.URI
 import kotlin.jvm.optionals.getOrElse
@@ -93,7 +102,34 @@ class ConfigManager {
         reconnectDelaySec = config.getOptional<Long>("reconnect-delay-sec").getOrElse { 60L }
         if (reconnectDelaySec <= 0) reconnectDelaySec = 60L
     }
-    fun reloadConfig(){
+
+    fun reloadConfig() {
         initAndLoadConfig()
+        Main.httpClient.close()
+        initHttpClient()
+    }
+
+    fun initHttpClient() {
+        Main.httpClient = HttpClient(CIO) {
+            install(ContentNegotiation) {
+                json()
+            }
+            install(WebSockets) {
+                pingIntervalMillis = configManager.wsPingIntervalSec * 1000L
+                maxFrameSize = 256 * 1024
+            }
+            followRedirects = true
+            install(HttpRedirect) {
+                checkHttpMethod = false
+            }
+            install(HttpTimeout) {
+                requestTimeoutMillis = configManager.requestTimeoutSec * 1000L
+                connectTimeoutMillis = configManager.connectionTimeoutSec * 1000L
+            }
+            defaultRequest {
+                header(HttpHeaders.ContentType, ContentType.Application.Json)
+                header("X-Webhook-Secret", configManager.secret)
+            }
+        }
     }
 }
