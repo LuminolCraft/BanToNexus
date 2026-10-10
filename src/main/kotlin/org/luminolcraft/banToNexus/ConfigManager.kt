@@ -31,7 +31,10 @@ class ConfigManager {
     var requestTimeoutSec = 0L
 
     @Volatile
-    var pendingFlushBatchSize = 0L
+    var retryIntervalSec = 0L
+
+    @Volatile
+    var pendingFlushBatchSize = 0
 
     @Volatile
     var wsPingIntervalSec = 0L
@@ -62,8 +65,12 @@ class ConfigManager {
             config.set<Long>("request-timeout-sec", 10L)
             shouldSave = true
         }
-        if (config.getOptional<Long>("pending-flush-batch-size").isEmpty) {
-            config.set<Long>("pending-flush-batch-size", 20L)
+        if(config.getOptional<Long>("retry-interval-sec").isEmpty) {
+            config.set<Long>("retry-interval-sec", 10L)
+            shouldSave = true
+        }
+        if (config.getOptional<Int>("pending-flush-batch-size").isEmpty) {
+            config.set<Int>("pending-flush-batch-size", 20L)
             shouldSave = true
         }
         if (config.getOptional<Long>("ws-ping-interval-sec").isEmpty) {
@@ -95,8 +102,10 @@ class ConfigManager {
         if (connectionTimeoutSec <= 0) connectionTimeoutSec = 5L
         requestTimeoutSec = config.getOptional<Long>("request-timeout-sec").getOrElse { 10L }
         if (requestTimeoutSec <= 0) requestTimeoutSec = 10L
-        pendingFlushBatchSize = config.getOptional<Long>("pending-flush-batch-size").getOrElse { 20L }
-        if (pendingFlushBatchSize <= 0) pendingFlushBatchSize = 20L
+        retryIntervalSec = config.getOptional<Long>("retry-interval-sec").getOrElse { 30L }
+        if (retryIntervalSec <= 0) retryIntervalSec = 30L
+        pendingFlushBatchSize = config.getOptional<Int>("pending-flush-batch-size").getOrElse { 20 }
+        if (pendingFlushBatchSize <= 0) pendingFlushBatchSize = 20
         wsPingIntervalSec = config.getOptional<Long>("ws-ping-interval-sec").getOrElse { 30L }
         if (wsPingIntervalSec <= 0) wsPingIntervalSec = 30L
         reconnectDelaySec = config.getOptional<Long>("reconnect-delay-sec").getOrElse { 60L }
