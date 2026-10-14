@@ -9,6 +9,7 @@ import space.arim.libertybans.api.PlayerVictim
 import space.arim.libertybans.api.PunishmentType
 import space.arim.libertybans.api.event.PostPardonEvent
 import space.arim.libertybans.api.event.PostPunishEvent
+import java.time.Instant
 
 class EventManager {
 
@@ -41,7 +42,7 @@ class EventManager {
             punishment.reason,
             operator,
             punishment.startDate.toEpochMilli(),
-            punishment.endDate.toEpochMilli()
+            if(punishment.endDate != Instant.MAX) punishment.endDate.toEpochMilli() else null
         )
         scope.launch {
             Main.postAddBan(envelope)
@@ -77,7 +78,7 @@ class EventManager {
             punishment.reason,
             operator,
             punishment.startDate.toEpochMilli(),
-            punishment.endDate.toEpochMilli()
+            if(punishment.endDate != Instant.MAX) punishment.endDate.toEpochMilli() else null
         )
         scope.launch {
             Main.postRevokeBan(envelope)

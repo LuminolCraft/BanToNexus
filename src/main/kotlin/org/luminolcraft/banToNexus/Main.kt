@@ -14,18 +14,22 @@ import io.ktor.client.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.util.collections.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.time.delay
 import net.kyori.adventure.text.minimessage.MiniMessage
 import org.slf4j.Logger
 import space.arim.libertybans.api.*
+import space.arim.libertybans.api.punish.Punishment
 import space.arim.omnibus.Omnibus
 import space.arim.omnibus.OmnibusProvider
 import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
 import java.util.*
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.math.min
 
 @Plugin(
     id = "bantonexus", name = "BanToNexus", version = "0.1", authors = ["NatJerry"]
@@ -39,28 +43,158 @@ open class Main @Inject constructor(
         lateinit var instance: Main
         val dataDirectory: Path
             get() = instance.dataDirectory
-        val permissionNode = "bantonexus.usage"
+        const val PERMISSION_NODE = "bantonexus.usage"
         val gson = Gson()
-        val retryPackageMap = mutableMapOf<String, ActionType>()
-        var stateVersion = 0L
+        val retryPackageMap = ConcurrentMap<Ban, ActionType>()
+        val stateVersion = AtomicLong(0L)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         val miniMessage = MiniMessage.miniMessage()
+        val socketManager = SocketManager()
         lateinit var configManager: ConfigManager
         lateinit var httpClient: HttpClient
         lateinit var apiOmni: Omnibus
         lateinit var apiLibertyBans: LibertyBans
         private var timerJob: Job? = null
 
+
         fun isRequiredResync(responseBody: String): Boolean {
-            val jsonObject = JsonParser.parseString(responseBody).asJsonObject
-            val element = jsonObject.getAsJsonObject("data").get("resync")
-            return element.isJsonNull || element.asBoolean
+            runCatching {
+                val jsonObject = runCatching {
+                    JsonParser.parseString(responseBody).asJsonObject
+                }.getOrElse {
+                    instance.logger.error("Ban sync 响应不是合法 JSON：${it.message}")
+                    return true
+                }
+                val element = jsonObject.getAsJsonObject("data").get("resync")
+                return element.isJsonNull || element.asBoolean
+            }.getOrElse {
+                return true
+            }
+        }
+
+        fun isRequiredIncrease(responseBody: String, stateVersion: Long): Boolean {
+            runCatching {
+                val jsonObject = JsonParser.parseString(responseBody).asJsonObject
+                val element = jsonObject.getAsJsonObject("data").get("stateVersion").asLong
+                return (element > stateVersion)
+            }.getOrElse {
+                return true
+            }
+        }
+
+        fun startTimerJob() {
+            timerJob?.cancel()
+            timerJob = scope.launch {
+                while (isActive) {
+                    if (retryPackageMap.isEmpty()) {
+                        delay(Duration.ofSeconds(configManager.retryIntervalSec))
+                        continue
+                    }
+                    val addBatch = mutableListOf<Ban>()
+                    val revokeBatch = mutableListOf<Ban>()
+                    synchronized(retryPackageMap) {
+                        for ([ban, type] in retryPackageMap) {
+                            when (type) {
+                                ActionType.ADD -> {
+                                    addBatch.add(ban)
+                                }
+
+                                ActionType.REVOKE -> {
+                                    revokeBatch.add(ban)
+                                }
+                            }
+                        }
+                    }
+                    for (i in 0..addBatch.size step configManager.pendingFlushBatchSize) {
+                        if (i >= addBatch.size) break
+                        val sendBatch = addBatch.subList(i, min(i + configManager.pendingFlushBatchSize, addBatch.size))
+                        val packagedBatchEnvelope = gson.toJson(sendBatch)
+                        val response: HttpResponse
+                        try {
+                            response = httpClient.post(configManager.httpUrl + "/api/v1/internal/ban/sync") {
+                                contentType(ContentType.Application.Json)
+                                header("X-Ban-State-Version", stateVersion.get())
+                                setBody(packagedBatchEnvelope)
+                            }
+                        } catch (e: CancellationException) {
+                            return@launch
+                        } catch (e: Exception) {
+                            instance.logger.error("Error while syncing ban." + e.message)
+                            sendBatch.forEach {
+                                retryPackageMap[it] = ActionType.ADD
+                            }
+                            continue
+                        }
+                        if (!response.status.isSuccess()) {
+                            instance.logger.error("Error while syncing ban.")
+                            sendBatch.forEach {
+                                retryPackageMap[it] = ActionType.ADD
+                            }
+                            continue
+                        }
+                        val text = response.bodyAsText()
+                        if (isRequiredResync(text)) {
+                            scope.launch {
+                                getFullBans()
+                            }
+                            sendBatch.forEach {
+                                retryPackageMap[it] = ActionType.ADD
+                            }
+                            continue
+                        }
+                        for (ban in sendBatch) {
+                            retryPackageMap.remove(ban)
+                        }
+                        if (isRequiredIncrease(text, stateVersion.get())) stateVersion.incrementAndGet()
+                    }
+                    for (envelope in revokeBatch) {
+                        val response: HttpResponse
+                        try {
+                            response = httpClient.post(configManager.httpUrl + "/api/v1/internal/ban/revoke") {
+                                contentType(ContentType.Application.Json)
+                                header("X-Ban-State-Version", stateVersion.get())
+                                setBody(envelope)
+                            }
+                        } catch (e: CancellationException) {
+                            return@launch
+                        } catch (e: Exception) {
+                            instance.logger.error("Error while syncing ban revoke." + e.message)
+                            retryPackageMap[envelope] = ActionType.REVOKE
+                            continue
+                        }
+                        if (response.status.value == 404) {
+                            retryPackageMap.remove(envelope)
+                            continue
+                        }
+                        if (!response.status.isSuccess()) {
+                            instance.logger.warn("Failed to syncing ban revoke.")
+                            retryPackageMap[envelope] = ActionType.REVOKE
+                            continue
+                        }
+                        val text = response.bodyAsText()
+                        if (isRequiredResync(text)) {
+                            scope.launch {
+                                getFullBans()
+                            }
+                            retryPackageMap[envelope] = ActionType.REVOKE
+                            continue
+                        }
+                        retryPackageMap.remove(envelope)
+                        if (isRequiredIncrease(text, stateVersion.get())) stateVersion.incrementAndGet()
+                    }
+                }
+            }
+        }
+
+        fun stopTimerJob() {
+            timerJob?.cancel()
+            timerJob = null
         }
 
         suspend fun getFullBans() {
             val response: HttpResponse
             try {
-                response = httpClient.get(configManager.url + "/api/v1/internal/ban/sync")
+                response = httpClient.get(configManager.httpUrl + "/api/v1/internal/ban/sync")
             } catch (e: CancellationException) {
                 return
             } catch (e: Exception) {
@@ -71,14 +205,17 @@ open class Main @Inject constructor(
                 instance.logger.error("Error while syncing ban from Nexus. Code ${response.status}")
                 return
             }
-            val jsonObject = JsonParser.parseString(response.bodyAsText()).asJsonObject
+            val jsonObject = runCatching { JsonParser.parseString(response.bodyAsText()).asJsonObject }.getOrElse {
+                instance.logger.error("Ban sync 响应不是合法 JSON：${it.message}")
+                return
+            }
             if (jsonObject.get("stateVersion").isJsonNull) return
-            stateVersion = jsonObject.get("stateVersion").asLong
+            stateVersion.set(jsonObject.get("stateVersion").asLong)
             if (jsonObject.get("bans").isJsonNull) return
-            val type = object : TypeToken<List<Ban>>() {}.type
-            val bans: List<Ban> = gson.fromJson(jsonObject.get("bans"), type)
+            val type = object : TypeToken<MutableList<Ban>>() {}.type
+            val bans: MutableList<Ban> = gson.fromJson(jsonObject.get("bans"), type)
+            val nextBans = bans.toMutableList()
             val bansUuidRemote: List<String> = bans.map { it.uuid }
-
             apiLibertyBans.selector
                 .selectionBuilder()
                 .type(PunishmentType.BAN)
@@ -86,96 +223,138 @@ open class Main @Inject constructor(
                 .victimType(Victim.VictimType.PLAYER)
                 .build()
                 .allSpecificPunishments
-                .thenAccept {
+                .thenAcceptSync {
                     //Handle dupe.
                     for (punish in it) {
                         if (punish.victim.type != Victim.VictimType.PLAYER) continue
                         val localUuid = (punish.victim as PlayerVictim).uuid.toString()
                         if (bansUuidRemote.contains(localUuid)) {
                             val num = bansUuidRemote.indexOf(localUuid)
-                            if (bans[num].expiredAt == punish.endDate.toEpochMilli()) {
-                                if (bans[num].reason == punish.reason) continue
+                            var checkReason = false
+                            var isPermanent = false
+                            if (bans[num].expiredAt == null && punish.endDate == Instant.MAX) {
+                                checkReason = true
+                            } else if (punish.endDate != Instant.MAX && bans[num].expiredAt == null) {
+                                isPermanent = true
+                            } else if (bans[num].expiredAt != null && punish.endDate == Instant.MAX) {
+                                1
+                            } else {
+                                checkReason = true
                             }
+                            if (checkReason) {
+                                if (bans[num].reason == punish.reason) {
+                                    nextBans.remove(bans[num])
+                                    continue
+                                }
+                            }
+                            var remove = true
                             punish.modifyPunishment {
-                                it.setEndDate(Instant.ofEpochMilli(bans[num].expiredAt))
+
+//                                if(!isPermanent)bans[num].expiredAt?.let { epochMilli -> it.setEndDate(Instant.ofEpochMilli(epochMilli))
+//                                else {it.setEndDate(Punishment.PERMANENT_END_DATE)}}
+                                it.setEndDate(if (isPermanent || bans[num].expiredAt == null) Punishment.PERMANENT_END_DATE else bans[num].expiredAt?.let {
+                                    Instant.ofEpochMilli(
+                                        it
+                                    )
+                                })
                                 it.setReason(bans[num].reason)
                             }.exceptionally {
                                 instance.logger.error("Fail to sync, trace:" + it.message)
+                                remove = false
                                 null
+                            }.toCompletableFuture().let {
+                                runCatching { it.join() }.onFailure {
+                                }
                             }
-                            bans.drop(num)
+                            if (remove) {
+                                nextBans.remove(bans[num])
+                            }
                         }
                     }
+                }.toCompletableFuture().let {
+                    runCatching { it.join() }.onFailure {
+                        instance.logger.error("Ban sync 对账失败：${it.message}")
+                    }
                 }
-            for (ban in bans) {
-                val draftBan = apiLibertyBans.drafter
+
+            for ((_, uuid, reason, _, _, expiredAt) in nextBans) {
+                val draftBanBuilder = apiLibertyBans.drafter
                     .draftBuilder()
                     .type(PunishmentType.BAN)
-                    .reason(ban.reason)
-                    .victim(PlayerVictim.of(UUID.fromString(ban.uuid)))
+                    .reason(reason)
+                    .victim(PlayerVictim.of(UUID.fromString(uuid)))
                     .operator(ConsoleOperator.INSTANCE)
-                    .duration(Duration.ofMillis(ban.expiredAt - System.currentTimeMillis()))
-                    .build()
-                draftBan.enactPunishment()
+                if (expiredAt != null) {
+                    draftBanBuilder.duration(Duration.ofMillis(expiredAt - System.currentTimeMillis()))
+                }
+                draftBanBuilder.build().enactPunishment().toCompletableFuture().let {
+                    runCatching { it.join() }.onFailure {
+                        instance.logger.error("Ban sync 对账失败：${it.message}")
+                    }
+                }
             }
         }
 
         suspend fun postAddBan(envelope: Ban) {
-            val packagedEnvelope = gson.toJson(envelope)
             val response: HttpResponse
             try {
-                response = httpClient.post(configManager.url + "/api/v1/internal/ban/add") {
+                response = httpClient.post(configManager.httpUrl + "/api/v1/internal/ban/add") {
                     contentType(ContentType.Application.Json)
-                    setBody(packagedEnvelope)
+                    header("X-Ban-State-Version", stateVersion.get())
+                    setBody(gson.toJson(envelope))
                 }
             } catch (e: CancellationException) {
                 return
             } catch (e: Exception) {
                 instance.logger.error("Error while posting ban add." + e.message)
-                retryPackageMap[packagedEnvelope] = ActionType.ADD
+                retryPackageMap[envelope] = ActionType.ADD
                 return
             }
 
             if (!response.status.isSuccess()) {
                 instance.logger.warn("Failed to post ban add.")
-                retryPackageMap[packagedEnvelope] = ActionType.ADD
+                retryPackageMap[envelope] = ActionType.ADD
+                return
             }
-            isRequiredResync(response.bodyAsText())
-            if (isRequiredResync(response.bodyAsText())) {
+            val text = response.bodyAsText()
+            if (isRequiredResync(text)) {
                 scope.launch {
                     getFullBans()
                 }
-                retryPackageMap[packagedEnvelope] = ActionType.ADD
+                retryPackageMap[envelope] = ActionType.ADD
             }
+            if (isRequiredIncrease(text, stateVersion.get())) stateVersion.incrementAndGet()
         }
 
         suspend fun postRevokeBan(envelope: Ban) {
-            val packagedEnvelope = gson.toJson(envelope)
             val response: HttpResponse
             try {
-                response = httpClient.post(configManager.url + "/api/v1/internal/ban/revoke") {
+                response = httpClient.post(configManager.httpUrl + "/api/v1/internal/ban/revoke") {
                     contentType(ContentType.Application.Json)
-                    header("X-Ban-State-Version", stateVersion)
-                    setBody(packagedEnvelope)
+                    header("X-Ban-State-Version", stateVersion.get())
+                    setBody(gson.toJson(envelope))
                 }
             } catch (e: CancellationException) {
                 return
             } catch (e: Exception) {
                 instance.logger.error("Error while posting ban revoke." + e.message)
-                retryPackageMap[packagedEnvelope] = ActionType.REVOKE
+                retryPackageMap[envelope] = ActionType.REVOKE
                 return
             }
             if (!response.status.isSuccess()) {
                 instance.logger.warn("Failed to post ban revoke.")
-                retryPackageMap[packagedEnvelope] = ActionType.REVOKE
+                retryPackageMap[envelope] = ActionType.REVOKE
                 return
             }
-            if (isRequiredResync(response.bodyAsText())) {
+            val text = response.bodyAsText()
+            if (isRequiredResync(text)) {
                 scope.launch {
                     getFullBans()
                 }
-                retryPackageMap[packagedEnvelope] = ActionType.REVOKE
+                retryPackageMap[envelope] = ActionType.REVOKE
             }
+
+            if (isRequiredIncrease(text, stateVersion.get())) stateVersion.incrementAndGet()
         }
     }
 
@@ -185,7 +364,7 @@ open class Main @Inject constructor(
         val reason: String,
         val operator: String,
         val createdAt: Long,
-        val expiredAt: Long
+        val expiredAt: Long?
     )
 
     @Subscribe
@@ -194,111 +373,25 @@ open class Main @Inject constructor(
         configManager = ConfigManager()
         configManager.initAndLoadConfig()
         configManager.initHttpClient()
-        server.eventManager.register(this, EventManager())
         apiOmni = OmnibusProvider.getOmnibus()
         apiLibertyBans = apiOmni.registry.getProvider(LibertyBans::class.java).orElseThrow()
+        server.eventManager.register(this, EventManager())
+        scope.launch {
+            getFullBans()
+        }
+        startTimerJob()
+        socketManager.start()
     }
 
     @Subscribe
     fun onProxyShutDown(event: ProxyShutdownEvent) {
+        stopTimerJob()
+        scope.cancel()
+        socketManager.stop()
+        socketManager.stopScope()
         server.eventManager.unregisterListeners(this)
         httpClient.close()
     }
 
-    fun startTimerJob() {
-        timerJob?.cancel()
-        timerJob = scope.launch {
-            while (isActive) {
-                if (retryPackageMap.isEmpty()) {
-                    delay(Duration.ofSeconds(configManager.retryIntervalSec))
-                    return@launch
-                }
-                val addBatch = mutableListOf<String>()
-                val revokeBatch = mutableListOf<String>()
-                synchronized(retryPackageMap) {
-                    for ([ban, type] in retryPackageMap) {
-                        when (type) {
-                            ActionType.ADD -> {
-                                addBatch.add(ban)
-                            }
 
-                            ActionType.REVOKE -> {
-                                revokeBatch.add(ban)
-                            }
-                        }
-                    }
-                }
-                for (i in 1..addBatch.size step configManager.pendingFlushBatchSize) {
-                    val sendBatch = addBatch.subList(i, i + 20)
-                    val packagedBatchEnvelope = gson.toJson(sendBatch)
-                    val response: HttpResponse
-                    try {
-                        response = httpClient.post(configManager.url + "/api/v1/internal/ban/revoke") {
-                            contentType(ContentType.Application.Json)
-                            header("X-Ban-State-Version", stateVersion)
-                            setBody(packagedBatchEnvelope)
-                        }
-                    } catch (e: CancellationException) {
-                        return@launch
-                    } catch (e: Exception) {
-                        instance.logger.error("Error while syncing ban." + e.message)
-                        sendBatch.forEach {
-                            retryPackageMap[it] = ActionType.ADD
-                        }
-                        continue
-                    }
-                    if (!response.status.isSuccess()) {
-                        instance.logger.error("Error while syncing ban.")
-                        sendBatch.forEach {
-                            retryPackageMap[it] = ActionType.ADD
-                        }
-                        continue
-                    }
-                    if (isRequiredResync(response.bodyAsText())) {
-                        scope.launch {
-                            getFullBans()
-                        }
-                        sendBatch.forEach {
-                            retryPackageMap[it] = ActionType.ADD
-                        }
-                        continue
-                    }
-                }
-                for (envelope in revokeBatch) {
-                    val response: HttpResponse
-                    try {
-                        response = httpClient.post(configManager.url + "/api/v1/internal/ban/revoke") {
-                            contentType(ContentType.Application.Json)
-                            header("X-Ban-State-Version", stateVersion)
-                            setBody(envelope)
-                        }
-                    } catch (e: CancellationException) {
-                        return@launch
-                    } catch (e: Exception) {
-                        instance.logger.error("Error while syncing ban revoke." + e.message)
-                        retryPackageMap[envelope] = ActionType.REVOKE
-                        continue
-                    }
-                    if (!response.status.isSuccess()) {
-                        instance.logger.warn("Failed to syncing ban revoke.")
-                        retryPackageMap[envelope] = ActionType.REVOKE
-                        continue
-                    }
-                    if (isRequiredResync(response.bodyAsText())) {
-                        scope.launch {
-                            getFullBans()
-                        }
-                        retryPackageMap[envelope] = ActionType.REVOKE
-                    }
-                }
-            }
-        }
-    }
-
-    fun stopTimerJob() {
-        timerJob?.cancel()
-        timerJob = null
-    }
-
-    //TODO sync logic.
 }

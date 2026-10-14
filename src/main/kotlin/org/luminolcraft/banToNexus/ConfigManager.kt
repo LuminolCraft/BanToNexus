@@ -19,7 +19,10 @@ class ConfigManager {
     private val config = CommentedFileConfig.of(configFile)
 
     @Volatile
-    var url = ""
+    var httpUrl = ""
+
+    @Volatile
+    var wsUrl = ""
 
     @Volatile
     var secret = ""
@@ -51,6 +54,12 @@ class ConfigManager {
         config.load()
         if (config.getOptional<String>("api-base-url").isEmpty) {
             config.set<String>("api-base-url", "http://localhost:8080")
+            config.setComment("api-base-url", """Recommend using https for better security.""")
+            shouldSave = true
+        }
+        if (config.getOptional<String>("ws-url").isEmpty) {
+            config.set<String>("ws-url", "ws://localhost:8080")
+            config.setComment("ws-url", """Recommend using wss for better security.""")
             shouldSave = true
         }
         if (config.getOptional<String>("secret").isEmpty) {
@@ -65,12 +74,12 @@ class ConfigManager {
             config.set<Long>("request-timeout-sec", 10L)
             shouldSave = true
         }
-        if(config.getOptional<Long>("retry-interval-sec").isEmpty) {
-            config.set<Long>("retry-interval-sec", 10L)
+        if (config.getOptional<Long>("retry-interval-sec").isEmpty) {
+            config.set<Long>("retry-interval-sec", 30L)
             shouldSave = true
         }
         if (config.getOptional<Int>("pending-flush-batch-size").isEmpty) {
-            config.set<Int>("pending-flush-batch-size", 20L)
+            config.set<Int>("pending-flush-batch-size", 20)
             shouldSave = true
         }
         if (config.getOptional<Long>("ws-ping-interval-sec").isEmpty) {
@@ -91,11 +100,22 @@ class ConfigManager {
             if (apiBaseUrlRaw.isPresent) {
                 val scheme = URI.create(apiBaseUrlRaw.get()).scheme
                 if (scheme == "http" || scheme == "https") {
-                    url = apiBaseUrlRaw.get()
+                    httpUrl = apiBaseUrlRaw.get().trimEnd('/')
                     return@run null
                 }
             }
-            url = "http://localhost:8080"
+            httpUrl = "http://localhost:8080"
+        }
+        run {
+            val wsUrlRaw = config.getOptional<String>("ws-url")
+            if (wsUrlRaw.isPresent) {
+                val scheme = URI.create(wsUrlRaw.get()).scheme
+                if (scheme == "ws" || scheme == "wss") {
+                    wsUrl = wsUrlRaw.get().trimEnd('/')
+                    return@run null
+                }
+                wsUrl = "ws://localhost:8080"
+            }
         }
         secret = config.getOptional<String>("secret").getOrElse { "some-fucking-secret" }
         connectionTimeoutSec = config.getOptional<Long>("connection-timeout-sec").getOrElse { 5L }
@@ -113,9 +133,13 @@ class ConfigManager {
     }
 
     fun reloadConfig() {
+        Main.stopTimerJob()
+        Main.socketManager.stop()
         initAndLoadConfig()
         Main.httpClient.close()
         initHttpClient()
+        Main.startTimerJob()
+        Main.socketManager.start()
     }
 
     fun initHttpClient() {
