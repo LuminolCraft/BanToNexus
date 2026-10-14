@@ -57,6 +57,8 @@ open class Main @Inject constructor(
         private var timerJob: Job? = null
 
 
+        // 解析失败一律按“需要重拉快照”处理（fail-safe）：后端响应异常时，
+        // 宁可贵一点多拉一次快照，也不要因为少判一次而漏掉封禁变更。
         fun isRequiredResync(responseBody: String): Boolean {
             runCatching {
                 val jsonObject = runCatching {
@@ -105,6 +107,7 @@ open class Main @Inject constructor(
                             }
                         }
                     }
+                    // 按配置的批量上限分片；上界必须取 min，否则最后一片会越过列表末尾
                     for (i in 0..addBatch.size step configManager.pendingFlushBatchSize) {
                         if (i >= addBatch.size) break
                         val sendBatch = addBatch.subList(i, min(i + configManager.pendingFlushBatchSize, addBatch.size))
@@ -142,6 +145,8 @@ open class Main @Inject constructor(
                             }
                             continue
                         }
+                        // 一次上报请求只会让后端的 stateVersion +1，成功即视为已送达；
+                        // 不在这里移除的话队列永远非空，每一轮都会把同一批重新发一遍
                         for (ban in sendBatch) {
                             retryPackageMap.remove(ban)
                         }
@@ -162,6 +167,8 @@ open class Main @Inject constructor(
                             retryPackageMap[envelope] = ActionType.REVOKE
                             continue
                         }
+                        // 404 是终态而不是临时故障：后端按 createdAt 定位封禁，
+                        // 后台创建的封禁、已撤销的封禁都会命中这里，重试永远不会成功
                         if (response.status.value == 404) {
                             retryPackageMap.remove(envelope)
                             continue
@@ -210,10 +217,14 @@ open class Main @Inject constructor(
                 return
             }
             if (jsonObject.get("stateVersion").isJsonNull) return
+            // 先落游标再应用：版本号与快照出自同一次事务读，所以先记下来；
+            // 若后面的 apply 失败，该条目要等下一次快照才会重试
             stateVersion.set(jsonObject.get("stateVersion").asLong)
             if (jsonObject.get("bans").isJsonNull) return
             val type = object : TypeToken<MutableList<Ban>>() {}.type
             val bans: MutableList<Ban> = gson.fromJson(jsonObject.get("bans"), type)
+            // nextBans 必须是副本：它是“还需要本地落地”的集合，下面会不断删元素；
+            // bans 本身保持冻结，这样 bansUuidRemote 的下标才始终指向同一条记录
             val nextBans = bans.toMutableList()
             val bansUuidRemote: List<String> = bans.map { it.uuid }
             apiLibertyBans.selector
@@ -230,6 +241,11 @@ open class Main @Inject constructor(
                         val localUuid = (punish.victim as PlayerVictim).uuid.toString()
                         if (bansUuidRemote.contains(localUuid)) {
                             val num = bansUuidRemote.indexOf(localUuid)
+                            // 两个维度：bans[num].expiredAt 是后端到期时间（null = 永久），
+                            // punish.endDate 是本地到期时间（Instant.MAX = 永久）。
+                            // checkReason=true 表示“只需再比一次理由，相同就跳过改动”；
+                            // isPermanent=true 表示后端是永久，要把本地改回永久。
+                            // 注意：有限期对有限期的组合走最后的 else，并不比较到期时间是否相等。
                             var checkReason = false
                             var isPermanent = false
                             if (bans[num].expiredAt == null && punish.endDate == Instant.MAX) {
@@ -247,6 +263,9 @@ open class Main @Inject constructor(
                                     continue
                                 }
                             }
+                            // remove 只有在内层 stage 被 join 之后才能反映真实结果：
+                            // exceptionally 是异步回调，若不 join，它还没执行到这里，
+                            // remove 恒为 true，失败条目也会被移出 nextBans 而不再补落地
                             var remove = true
                             punish.modifyPunishment {
 
@@ -285,6 +304,8 @@ open class Main @Inject constructor(
                     .victim(PlayerVictim.of(UUID.fromString(uuid)))
                     .operator(ConsoleOperator.INSTANCE)
                 if (expiredAt != null) {
+                    // draft 接收的是“从现在起多久”的相对时长而不是绝对时间戳；
+                    // 为 null 表示永久处罚，此时不能调用 duration()
                     draftBanBuilder.duration(Duration.ofMillis(expiredAt - System.currentTimeMillis()))
                 }
                 draftBanBuilder.build().enactPunishment().toCompletableFuture().let {

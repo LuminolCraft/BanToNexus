@@ -30,6 +30,8 @@ class SocketManager {
                     Main.httpClient.webSocket(
                         urlString = Main.configManager.wsUrl + "/api/v1/internal/ban/ws",
                         request = {
+                            // 覆盖 ConfigManager 里全局的 HttpTimeout：那条是为普通请求设的，
+                            // 会按 requestTimeoutSec 把已建立的 WS 会话一起掐掉
                             timeout {
                                 requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
                                 socketTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
@@ -59,6 +61,8 @@ class SocketManager {
                                 when (frame) {
                                     is Frame.Text -> {
                                         val text = frame.readText()
+                                        // 文本 "pong" 是服务端对心跳 "ping" 的自动回复，不是业务帧；
+                                        // 这里必须 continue 而不能 break，否则每轮心跳都会拆掉连接
                                         if (text.equals("pong")) continue
                                         val obj = runCatching {
                                             Json.parseToJsonElement(text).jsonObject
@@ -77,6 +81,8 @@ class SocketManager {
                                             }
 
                                             "ban.create", "ban.update", "ban.revoke" -> {
+                                                // 帧内版本与本地游标不连续（丢帧或被重放）时，
+                                                // 立即重拉一次全量快照，不再等周期检测
                                                 if (stateVersion != Main.stateVersion.get() + 1L) {
                                                     Main.getFullBans()
                                                 }
@@ -171,6 +177,8 @@ class SocketManager {
                                                         ).undoPunishment()
                                                     }
                                                 }
+                                                // 应用完成后才推进游标，且只前进不后退，
+                                                // 避免乱序到达的旧帧把游标拉回去
                                                 if (stateVersion > Main.stateVersion.get()) Main.stateVersion.set(
                                                     stateVersion
                                                 )
@@ -192,6 +200,8 @@ class SocketManager {
                     }
                 } catch (e: CancellationException) {
                 } catch (e: Exception) {
+                    // 401/403 是凭据或地址错误，属于配置问题，退避重连治不好；
+                    // 其余异常（网络抖动、服务端重启）才值得重试
                     val fatal = run {
                         (e as? ClientRequestException)?.let { return@run it.response.status.value }
                         val m = Regex("\\b(401|403)\\b").find(e.message ?: "") ?: return@run null
@@ -208,6 +218,9 @@ class SocketManager {
         }
     }
 
+    // stop() 只结束当前连接循环，不取消 scope：配置热重载需要 stop() 后立刻 start()，
+    // 若在这里 cancel() scope，而 scope 是构造时创建的 val，之后就再也起不来了。
+    // 进程退出时才调用 stopScope()
     fun stop() {
         session?.let { s ->
             runBlocking { runCatching { s.close(CloseReason(CloseReason.Codes.NORMAL, "shutdown")) } }

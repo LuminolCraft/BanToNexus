@@ -42,6 +42,8 @@ class EventManager {
             punishment.reason,
             operator,
             punishment.startDate.toEpochMilli(),
+            // LibertyBans 用 Instant.MAX 表示永久处罚，而 Instant.MAX.toEpochMilli()
+            // 会抛 ArithmeticException（long 溢出），所以必须先判等再转换
             if(punishment.endDate != Instant.MAX) punishment.endDate.toEpochMilli() else null
         )
         scope.launch {
@@ -78,6 +80,8 @@ class EventManager {
             punishment.reason,
             operator,
             punishment.startDate.toEpochMilli(),
+            // LibertyBans 用 Instant.MAX 表示永久处罚，而 Instant.MAX.toEpochMilli()
+            // 会抛 ArithmeticException（long 溢出），所以必须先判等再转换
             if(punishment.endDate != Instant.MAX) punishment.endDate.toEpochMilli() else null
         )
         scope.launch {

@@ -57,6 +57,8 @@ class ConfigManager {
             config.setComment("api-base-url", """Recommend using https for better security.""")
             shouldSave = true
         }
+        // ws 与 http 分开配置：WebSocket 升级请求不能被反向代理（Netlify）转发，
+        // 代理会丢掉 Upgrade/Connection 头导致握手永远建不起来，必须直连源站域
         if (config.getOptional<String>("ws-url").isEmpty) {
             config.set<String>("ws-url", "ws://localhost:8080")
             config.setComment("ws-url", """Recommend using wss for better security.""")
@@ -95,6 +97,8 @@ class ConfigManager {
         }
 
         //Load
+        // 用 run + return@run 模拟提前返回：scheme 合法就采用配置值，
+        // 否则落到下面的默认地址
         run {
             val apiBaseUrlRaw = config.getOptional<String>("api-base-url")
             if (apiBaseUrlRaw.isPresent) {
@@ -132,6 +136,8 @@ class ConfigManager {
         if (reconnectDelaySec <= 0) reconnectDelaySec = 60L
     }
 
+    // 重载会重建 HttpClient，因此必须先把定时器和 socket 停掉：
+    // 否则新客户端建好之前，旧协程仍会拿着已被 close 的客户端发请求
     fun reloadConfig() {
         Main.stopTimerJob()
         Main.socketManager.stop()
