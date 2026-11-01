@@ -1,6 +1,9 @@
 package org.luminolcraft.banToNexus
 
+import com.electronwill.nightconfig.core.CommentedConfig
+import com.electronwill.nightconfig.core.ConfigFormat
 import com.electronwill.nightconfig.core.file.CommentedFileConfig
+import com.electronwill.nightconfig.yaml.YamlFormat
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.*
@@ -16,7 +19,14 @@ import kotlin.jvm.optionals.getOrElse
 
 class ConfigManager {
     private val configFile = File(Main.dataDirectory.toFile(), "config.yml")
-    private val config = CommentedFileConfig.of(configFile)
+    // 显式传格式，不走 FormatDetector 的扩展名探测：探测内部是 Class.forName，
+    // 解析用的是加载 night-config-core 的那个类加载器；Velocity 的 server.jar 自带 core 但只有 toml，
+    // 导致 yml 永远注册不上。直接引用 YamlFormat 可绕开这条运行时反射路径。
+    @Suppress("UNCHECKED_CAST")
+    private val config: CommentedFileConfig = CommentedFileConfig.of(
+        configFile,
+        YamlFormat.defaultInstance() as ConfigFormat<CommentedConfig>
+    )
 
     @Volatile
     var httpUrl = ""
@@ -51,7 +61,14 @@ class ConfigManager {
             if (!configFile.parentFile.exists()) configFile.parentFile.mkdirs()
             configFile.createNewFile()
         }
-        config.load()
+        // night-config 3.9.0 的 YamlParser 对空文档会直接 NPE：snakeyaml 返回 null 后仍调用 map.entrySet()。
+        // 首次运行走到这里时 config.yml 刚被 createNewFile() 成 0 字节，或用户只留了注释。
+        // 因此只有文件里真的存在键值时才解析，否则保持默认值，稍后由 config.save() 写成合法 YAML。
+        val hasContent = configFile.length() > 0L &&
+            configFile.useLines { lines -> lines.any { it.isNotBlank() && !it.trimStart().startsWith("#") } }
+        if (hasContent) {
+            config.load()
+        }
         if (config.getOptional<String>("api-base-url").isEmpty) {
             config.set<String>("api-base-url", "http://localhost:8080")
             config.setComment("api-base-url", """Recommend using https for better security.""")
